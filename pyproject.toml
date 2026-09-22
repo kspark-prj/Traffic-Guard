@@ -15,8 +15,9 @@ dependencies = [
     "websockets>=16.1.0",
 ]
 
-[project.scripts]
-fastgateway = "fastgateway:main"
+# 패키지로 패키징하지 않고 애플리케이션 프로젝트로 지정
+[tool.uv]
+package = false
 
 [build-system]
 requires = ["uv_build>=0.12.5,<0.13.0"]
