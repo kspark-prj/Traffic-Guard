@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+*.spec
+*.wal
+.codegraph/
+
+# PyInstaller build artifacts
+build/
+dist/
+
+# Compiled Rust extension (.pyd / .so)
+*.pyd
+*.so
+
+
+# IDE / Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+catalina_test.log
+
+# OS files
+Thumbs.db
+.DS_Store
+
+# Virtual environments
+venv/
+.venv/
+env/

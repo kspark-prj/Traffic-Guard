@@ -1,0 +1,23 @@
+[project]
+name = "fastgateway"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "kspark", email = "kspark.prj@gmail.com" }
+]
+requires-python = ">=3.13"
+dependencies = [
+    "fastapi>=0.141.0",
+    "pyjwt>=2.14.0",
+    "redis>=8.1.0",
+    "uvicorn>=0.53.0",
+    "websockets>=16.1.0",
+]
+
+[project.scripts]
+fastgateway = "fastgateway:main"
+
+[build-system]
+requires = ["uv_build>=0.12.5,<0.13.0"]
+build-backend = "uv_build"

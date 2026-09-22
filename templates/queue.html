@@ -1,0 +1,450 @@
+<!doctype html>
+<html lang="ko">
+    <head>
+        <meta charset="UTF-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+        <title>Traffic-Guard - 대기열</title>
+        <script src="https://cdn.tailwindcss.com"></script>
+        <style>
+            :root {
+                --primary: #3b82f6;
+                --bg-dark: #0f172a;
+                --card-bg: #1e293b;
+                --border: #334155;
+            }
+            body {
+                background: var(--bg-dark);
+                color: #e2e8f0;
+                font-family:
+                    'Inter',
+                    system-ui,
+                    -apple-system,
+                    sans-serif;
+                min-height: 100vh;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                overflow: hidden;
+            }
+
+            .bg-animated {
+                position: fixed;
+                inset: 0;
+                z-index: 0;
+                background: linear-gradient(135deg, #0f172a 0%, #1e1b4b 50%, #0f172a 100%);
+                background-size: 400% 400%;
+                animation: gradientShift 8s ease infinite;
+            }
+            @keyframes gradientShift {
+                0% {
+                    background-position: 0% 50%;
+                }
+                50% {
+                    background-position: 100% 50%;
+                }
+                100% {
+                    background-position: 0% 50%;
+                }
+            }
+
+            .particles {
+                position: fixed;
+                inset: 0;
+                z-index: 1;
+                pointer-events: none;
+                overflow: hidden;
+            }
+            .particle {
+                position: absolute;
+                width: 4px;
+                height: 4px;
+                background: rgba(99, 102, 241, 0.3);
+                border-radius: 50%;
+                animation: float linear infinite;
+            }
+            @keyframes float {
+                0% {
+                    transform: translateY(100vh) scale(0);
+                    opacity: 0;
+                }
+                10% {
+                    opacity: 1;
+                }
+                90% {
+                    opacity: 1;
+                }
+                100% {
+                    transform: translateY(-10vh) scale(1);
+                    opacity: 0;
+                }
+            }
+
+            .card {
+                background: var(--card-bg);
+                border: 1px solid var(--border);
+                border-radius: 16px;
+                position: relative;
+                z-index: 10;
+            }
+
+            .spinner-ring {
+                width: 160px;
+                height: 160px;
+                border-radius: 50%;
+                border: 4px solid #334155;
+                border-top-color: #6366f1;
+                animation: spin 1.5s linear infinite;
+                position: relative;
+            }
+            .spinner-ring::after {
+                content: '';
+                position: absolute;
+                inset: 8px;
+                border-radius: 50%;
+                border: 4px solid transparent;
+                border-top-color: #818cf8;
+                animation: spin 2s linear reverse infinite;
+            }
+            @keyframes spin {
+                to {
+                    transform: rotate(360deg);
+                }
+            }
+
+            .rank-number {
+                font-size: 3rem;
+                font-weight: 800;
+                background: linear-gradient(135deg, #818cf8, #6366f1, #4f46e5);
+                -webkit-background-clip: text;
+                -webkit-text-fill-color: transparent;
+                background-clip: text;
+                line-height: 1;
+            }
+
+            .progress-track {
+                height: 6px;
+                background: #334155;
+                border-radius: 999px;
+                overflow: hidden;
+            }
+            .progress-fill {
+                height: 100%;
+                background: linear-gradient(90deg, #6366f1, #818cf8);
+                border-radius: 999px;
+                transition: width 0.8s ease;
+            }
+
+            .pulse-dot {
+                width: 10px;
+                height: 10px;
+                background: #6366f1;
+                border-radius: 50%;
+                animation: pulseDot 2s ease-in-out infinite;
+            }
+            @keyframes pulseDot {
+                0%,
+                100% {
+                    box-shadow: 0 0 0 0 rgba(99, 102, 241, 0.6);
+                }
+                50% {
+                    box-shadow: 0 0 0 12px rgba(99, 102, 241, 0);
+                }
+            }
+
+            .success-icon {
+                width: 120px;
+                height: 120px;
+                border-radius: 50%;
+                background: linear-gradient(135deg, #059669, #10b981);
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                animation: scaleIn 0.5s cubic-bezier(0.175, 0.885, 0.32, 1.275);
+            }
+            @keyframes scaleIn {
+                0% {
+                    transform: scale(0);
+                }
+                100% {
+                    transform: scale(1);
+                }
+            }
+            .checkmark {
+                width: 50px;
+                height: 50px;
+                stroke: white;
+                stroke-width: 3;
+                fill: none;
+                stroke-linecap: round;
+                stroke-linejoin: round;
+                stroke-dasharray: 100;
+                stroke-dashoffset: 100;
+                animation: drawCheck 0.6s ease 0.3s forwards;
+            }
+            @keyframes drawCheck {
+                to {
+                    stroke-dashoffset: 0;
+                }
+            }
+
+            .error-icon {
+                width: 120px;
+                height: 120px;
+                border-radius: 50%;
+                background: linear-gradient(135deg, #dc2626, #ef4444);
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                animation: scaleIn 0.5s cubic-bezier(0.175, 0.885, 0.32, 1.275);
+            }
+
+            .fade-enter {
+                opacity: 0;
+                transform: translateY(10px);
+            }
+            .fade-active {
+                opacity: 1;
+                transform: translateY(0);
+                transition: all 0.4s ease;
+            }
+        </style>
+    </head>
+    <body>
+        <div class="bg-animated"></div>
+        <div class="particles" id="particles"></div>
+
+        <div class="w-full max-w-md mx-4" id="app">
+            <!-- WAITING STATE -->
+            <div id="stateWaiting" class="card p-8 text-center" style="display: none">
+                <div class="flex justify-center mb-6">
+                    <div class="spinner-ring flex items-center justify-center">
+                        <div class="absolute rank-number" id="rankDisplay">-</div>
+                    </div>
+                </div>
+
+                <h1 class="text-xl font-bold text-white mb-2">대기 중입니다</h1>
+                <p class="text-slate-400 text-sm mb-6">
+                    잠시만 기다려 주세요. 순서가 되면 자동으로 이동합니다.
+                </p>
+
+                <div class="grid grid-cols-2 gap-4 mb-6">
+                    <div class="bg-slate-800/50 rounded-xl p-4">
+                        <p class="text-slate-500 text-xs mb-1">내 순번</p>
+                        <p class="text-2xl font-bold text-indigo-400" id="rankText">-</p>
+                    </div>
+                    <div class="bg-slate-800/50 rounded-xl p-4">
+                        <p class="text-slate-500 text-xs mb-1">예상 대기시간</p>
+                        <p class="text-2xl font-bold text-indigo-400" id="etaText">-</p>
+                    </div>
+                </div>
+
+                <div class="progress-track mb-4">
+                    <div class="progress-fill" id="progressBar" style="width: 0%"></div>
+                </div>
+
+                <div class="flex items-center justify-center gap-2 text-xs text-slate-500">
+                    <div class="pulse-dot"></div>
+                    <span>실시간 웹소켓 연결 중</span>
+                </div>
+            </div>
+
+            <!-- SUCCESS STATE -->
+            <div id="stateSuccess" class="card p-8 text-center" style="display: none">
+                <div class="flex justify-center mb-6">
+                    <div class="success-icon">
+                        <svg class="checkmark" viewBox="0 0 50 50">
+                            <path d="M14 27 L 22 35 L 38 16" />
+                        </svg>
+                    </div>
+                </div>
+
+                <h1 class="text-xl font-bold text-white mb-2">입장이 허가되었습니다!</h1>
+                <p class="text-slate-400 text-sm mb-4">잠시 후 서비스 페이지로 이동합니다…</p>
+
+                <p class="text-indigo-400 text-sm font-mono" id="redirectCountdown">3초 후 이동</p>
+            </div>
+
+            <!-- ERROR STATE -->
+            <div id="stateError" class="card p-8 text-center" style="display: none">
+                <div class="flex justify-center mb-6">
+                    <div class="error-icon">
+                        <svg
+                            xmlns="http://www.w3.org/2000/svg"
+                            class="w-12 h-12 text-white"
+                            fill="none"
+                            viewBox="0 0 24 24"
+                            stroke="currentColor"
+                            stroke-width="2">
+                            <path
+                                stroke-linecap="round"
+                                stroke-linejoin="round"
+                                d="M6 18L18 6M6 6l12 12" />
+                        </svg>
+                    </div>
+                </div>
+
+                <h1 class="text-xl font-bold text-white mb-2" id="errorTitle">
+                    오류가 발생했습니다
+                </h1>
+                <p class="text-slate-400 text-sm mb-4" id="errorMessage">
+                    잠시 후 다시 시도해 주세요.
+                </p>
+
+                <button
+                    onclick="connectWebSocket()"
+                    class="bg-indigo-600 hover:bg-indigo-700 px-6 py-2.5 rounded-xl text-sm font-semibold text-white transition">
+                    재연결 시도
+                </button>
+            </div>
+
+            <!-- INITIAL / LOADING STATE -->
+            <div id="stateLoading" class="card p-8 text-center">
+                <div class="flex justify-center mb-4">
+                    <div class="spinner-ring"></div>
+                </div>
+                <p class="text-slate-400 text-sm">대기열에 연결 중입니다…</p>
+            </div>
+        </div>
+
+        <script>
+            const urlParams = new URLSearchParams(window.location.search);
+            const USER_ID =
+                urlParams.get('user_id') || 'user-' + Math.random().toString(36).substring(2, 10);
+            const REDIRECT_URL = urlParams.get('redirect_url') || '/';
+            const REDIRECT_DELAY_SEC = 3;
+
+            let ws = null;
+            let initialRank = null;
+            let currentToken = null;
+            let countdownTimer = null;
+
+            const $loading = document.getElementById('stateLoading');
+            const $waiting = document.getElementById('stateWaiting');
+            const $success = document.getElementById('stateSuccess');
+            const $error = document.getElementById('stateError');
+
+            (function initParticles() {
+                const container = document.getElementById('particles');
+                for (let i = 0; i < 30; i++) {
+                    const p = document.createElement('div');
+                    p.className = 'particle';
+                    p.style.left = Math.random() * 100 + '%';
+                    p.style.animationDuration = 6 + Math.random() * 8 + 's';
+                    p.style.animationDelay = Math.random() * 6 + 's';
+                    p.style.width = p.style.height = 2 + Math.random() * 4 + 'px';
+                    container.appendChild(p);
+                }
+            })();
+
+            function showState(state) {
+                [$loading, $waiting, $success, $error].forEach((el) => (el.style.display = 'none'));
+                state.style.display = 'block';
+                state.classList.remove('fade-active');
+                state.classList.add('fade-enter');
+                requestAnimationFrame(() => {
+                    state.classList.remove('fade-enter');
+                    state.classList.add('fade-active');
+                });
+            }
+
+            function formatETA(seconds) {
+                if (seconds <= 0) return '곧 입장';
+                if (seconds < 60) return Math.ceil(seconds) + '초';
+                const min = Math.floor(seconds / 60);
+                const sec = Math.ceil(seconds % 60);
+                return sec > 0 ? `${min}분 ${sec}초` : `${min}분`;
+            }
+
+            function connectWebSocket() {
+                showState($loading);
+                const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+                const wsUrl = `${proto}://${location.host}/ws/queue/status?user_id=${encodeURIComponent(USER_ID)}`;
+
+                ws = new WebSocket(wsUrl);
+
+                ws.onopen = () => {
+                    console.log('WebSocket connected');
+                };
+
+                ws.onmessage = (event) => {
+                    const data = JSON.parse(event.data);
+
+                    if (data.status === 'DENIED') {
+                        showState($error);
+                        document.getElementById('errorTitle').textContent = '접근이 차단되었습니다';
+                        document.getElementById('errorMessage').textContent =
+                            data.detail || '접근이 제한되었습니다.';
+                        ws.close();
+                        return;
+                    }
+
+                    if (data.status === 'ALLOWED') {
+                        currentToken = data.token;
+                        showState($success);
+                        startRedirectCountdown();
+                        return;
+                    }
+
+                    if (data.status === 'WAITING') {
+                        showState($waiting);
+                        const rank = data.rank || 0;
+                        const eta = data.estimated_seconds || 0;
+
+                        if (initialRank === null || rank > initialRank) {
+                            initialRank = rank;
+                        }
+
+                        document.getElementById('rankDisplay').textContent = rank;
+                        document.getElementById('rankText').textContent = `${rank}번`;
+                        document.getElementById('etaText').textContent = formatETA(eta);
+
+                        const progress =
+                            initialRank > 0
+                                ? Math.max(
+                                      0,
+                                      Math.min(100, ((initialRank - rank) / initialRank) * 100),
+                                  )
+                                : 0;
+                        document.getElementById('progressBar').style.width = progress + '%';
+                    }
+                };
+
+                ws.onerror = (err) => {
+                    console.error('WebSocket Error:', err);
+                };
+
+                ws.onclose = () => {
+                    console.log('WebSocket closed');
+                };
+            }
+
+            function startRedirectCountdown() {
+                let remaining = REDIRECT_DELAY_SEC;
+                const $cd = document.getElementById('redirectCountdown');
+                $cd.textContent = `${remaining}초 후 이동`;
+
+                countdownTimer = setInterval(() => {
+                    remaining--;
+                    if (remaining <= 0) {
+                        clearInterval(countdownTimer);
+                        performRedirect();
+                    } else {
+                        $cd.textContent = `${remaining}초 후 이동`;
+                    }
+                }, 1000);
+            }
+
+            function performRedirect() {
+                const url = new URL(REDIRECT_URL, window.location.origin);
+                if (currentToken) {
+                    sessionStorage.setItem('Traffic-Guard_token', currentToken);
+                    sessionStorage.setItem('Traffic-Guard_user_id', USER_ID);
+                    url.searchParams.set('queue_token', currentToken);
+                }
+                window.location.href = url.toString();
+            }
+
+            connectWebSocket();
+        </script>
+    </body>
+</html>
