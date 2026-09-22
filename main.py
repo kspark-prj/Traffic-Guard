@@ -5,7 +5,9 @@ Production-ready FastAPI backend for traffic surge protection.
 
 Features:
   - Variable virtual waiting room with automatic bypass/queue switching
-  - Active user TTL-based expiry management
+  - Active user TTL-based expiry & Web Heartbeat session management
+  - Ghost session auto-cleanup via Redis Key TTL (30s Expiration)
+  - Explicit session shift (Waiting Queue -> Active Users) and departure/logout API
   - Downstream load-aware dynamic TPS throttling
   - Real-time admin dashboard with WebSocket streaming
   - Real-time client waiting room with WebSocket streaming
@@ -13,6 +15,7 @@ Features:
 """
 
 import asyncio
+import json
 import logging
 import os
 import time
@@ -22,8 +25,9 @@ from pathlib import Path
 import jwt as pyjwt
 import redis.asyncio as aioredis
 import uvicorn
-from fastapi import FastAPI, Query, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 # ---------------------------------------------------------------------------
@@ -31,6 +35,8 @@ from pydantic import BaseModel, Field
 # ---------------------------------------------------------------------------
 BASE_DIR = Path(__file__).resolve().parent
 TEMPLATES_DIR = BASE_DIR / "templates"
+STATIC_DIR = BASE_DIR / "static"
+STATIC_DIR.mkdir(exist_ok=True)
 
 
 def load_template(filename: str) -> str:
@@ -50,6 +56,8 @@ REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
 JWT_SECRET = os.getenv("JWT_SECRET", "super-secret-key-change-in-production")
 JWT_ALGORITHM = "HS256"
 
+HEARTBEAT_TTL_SEC = 30  # Redis TTL for heartbeat session (30 seconds)
+
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
@@ -65,6 +73,7 @@ logger = logging.getLogger("Traffic-Guard")
 KEY_WAITING = "queue:waiting"  # ZSET  (score=timestamp, member=user_id)
 KEY_ACTIVE = "queue:active"  # SET   (member=user_id)
 KEY_ACTIVE_EXPIRY = "queue:active:expiry"  # ZSET  (score=expiry_epoch, member=user_id)
+KEY_HEARTBEAT_PREFIX = "queue:heartbeat:"  # STRING (val=status, EX=30s)
 KEY_CONFIG = "queue:config"  # HASH
 KEY_DOWNSTREAM = "queue:metrics:downstream"  # HASH
 KEY_PASS_COUNT = "queue:metrics:pass_count"  # STRING (counter)
@@ -101,6 +110,10 @@ class DownstreamMetrics(BaseModel):
 
 
 class ExpireTokenRequest(BaseModel):
+    user_id: str
+
+
+class HeartbeatRequest(BaseModel):
     user_id: str
 
 
@@ -160,6 +173,8 @@ async def _ensure_key_type(key: str, expected_type: str):
     """WrongType 오류 방지를 위해 Redis 키의 타입을 검증하고 다를 경우 초기화합니다."""
     try:
         current_type = await redis_client.type(key)
+        if isinstance(current_type, bytes):
+            current_type = current_type.decode()
         if current_type not in (expected_type, "none"):
             logger.warning(
                 "Key type mismatch for '%s': expected %s, found %s. Deleting key.",
@@ -173,10 +188,47 @@ async def _ensure_key_type(key: str, expected_type: str):
 
 
 # ---------------------------------------------------------------------------
-# Background Worker
+# Helper: State Shift & Session Cleanup
+# ---------------------------------------------------------------------------
+async def _shift_to_active(user_id: str, active_ttl: int) -> str:
+    """
+    [요구사항 1] 대기 유저(waiting_queue)를 액티브 유저(active_users) 목록으로 이관(Shift)하고 JWT 토큰을 발급합니다.
+    1. 대기열(KEY_WAITING)에서 해제 (ZREM)
+    2. 액티브 접속자 목록(KEY_ACTIVE) 및 만료 ZSET(KEY_ACTIVE_EXPIRY)으로 즉시 등록 (SADD, ZADD)
+    3. Redis Heartbeat TTL 30초 부여 (SET EX 30)
+    """
+    r = redis_client
+    now = time.time()
+    pipe = r.pipeline()
+    pipe.zrem(KEY_WAITING, user_id)
+    pipe.sadd(KEY_ACTIVE, user_id)
+    pipe.zadd(KEY_ACTIVE_EXPIRY, {user_id: now + active_ttl})
+    pipe.set(f"{KEY_HEARTBEAT_PREFIX}{user_id}", "active", ex=HEARTBEAT_TTL_SEC)
+    pipe.incr(KEY_PASS_COUNT)
+    await pipe.execute()
+    return await _issue_jwt(user_id)
+
+
+async def _cleanup_user_session(user_id: str):
+    """
+    [요구사항 3] 명시적 이탈/로그아웃 및 고스트 세션 자동 삭제 시 Redis 데이터를 즉시 파기(DEL, ZREM, SREM)합니다.
+    - 대기열(KEY_WAITING), 액티브 목록(KEY_ACTIVE), 액티브 만료 ZSET(KEY_ACTIVE_EXPIRY), Heartbeat 키 제거
+    """
+    r = redis_client
+    pipe = r.pipeline()
+    pipe.zrem(KEY_WAITING, user_id)
+    pipe.srem(KEY_ACTIVE, user_id)
+    pipe.zrem(KEY_ACTIVE_EXPIRY, user_id)
+    pipe.delete(f"{KEY_HEARTBEAT_PREFIX}{user_id}")
+    await pipe.execute()
+    logger.info("Cleaned up session and queue data for user: %s", user_id)
+
+
+# ---------------------------------------------------------------------------
+# Background Worker (Ghost Session Cleanup, Expiry & Batch Admission)
 # ---------------------------------------------------------------------------
 async def _worker_loop():
-    """Background worker: expires active users & admits waiting users."""
+    """Background worker: expires active users, cleans ghost sessions & admits waiting users."""
     r = redis_client
     logger.info("Background worker started")
     while True:
@@ -186,7 +238,35 @@ async def _worker_loop():
 
             now = time.time()
 
-            # --- 1. Active User Expiry Reclaim ---
+            # --- 1. Ghost Session Auto-Cleanup (Redis Heartbeat TTL Expiration) ---
+            # [요구사항 2] 30초 동안 하트비트를 보내지 않은 고스트 세션 자동 감지 및 삭제
+            waiting_users = await r.zrange(KEY_WAITING, 0, -1)
+            active_users = await r.smembers(KEY_ACTIVE)
+            all_queued_users = list(set(waiting_users) | set(active_users))
+
+            if all_queued_users:
+                pipe = r.pipeline()
+                for uid in all_queued_users:
+                    uid_str = uid if isinstance(uid, str) else uid.decode()
+                    pipe.exists(f"{KEY_HEARTBEAT_PREFIX}{uid_str}")
+                exists_flags = await pipe.execute()
+
+                ghost_users = [
+                    (uid if isinstance(uid, str) else uid.decode())
+                    for uid, exists in zip(all_queued_users, exists_flags)
+                    if not exists
+                ]
+
+                if ghost_users:
+                    logger.info("Found %d ghost session(s) without heartbeat: %s", len(ghost_users), ghost_users)
+                    pipe = r.pipeline()
+                    for ghost_id in ghost_users:
+                        pipe.zrem(KEY_WAITING, ghost_id)
+                        pipe.srem(KEY_ACTIVE, ghost_id)
+                        pipe.zrem(KEY_ACTIVE_EXPIRY, ghost_id)
+                    await pipe.execute()
+
+            # --- 2. Active User Expiry Reclaim ---
             expired = await r.zrangebyscore(KEY_ACTIVE_EXPIRY, "-inf", now)
             if expired:
                 pipe = r.pipeline()
@@ -194,10 +274,11 @@ async def _worker_loop():
                     uid_str = uid if isinstance(uid, str) else uid.decode()
                     pipe.srem(KEY_ACTIVE, uid_str)
                     pipe.zrem(KEY_ACTIVE_EXPIRY, uid_str)
+                    pipe.delete(f"{KEY_HEARTBEAT_PREFIX}{uid_str}")
                 await pipe.execute()
                 logger.info("Expired %d active user(s)", len(expired))
 
-            # --- 2. Dynamic TPS Throttling ---
+            # --- 3. Dynamic TPS Throttling ---
             auto_throttling = await _cfg_bool("auto_throttling_enabled")
             if auto_throttling:
                 cpu_raw = await r.hget(KEY_DOWNSTREAM, "cpu_usage")
@@ -214,7 +295,7 @@ async def _worker_loop():
                         new_batch = await _cfg_int("current_batch_size")
                     await r.hset(KEY_CONFIG, "current_batch_size", str(new_batch))
 
-            # --- 3. Admit Waiting Users ---
+            # --- 4. Admit Waiting Users (State Shift) ---
             is_paused = await _cfg_bool("is_paused")
             if not is_paused:
                 batch_size = await _cfg_int("current_batch_size")
@@ -228,9 +309,10 @@ async def _worker_loop():
                             uid_str = member if isinstance(member, str) else member.decode()
                             pipe.sadd(KEY_ACTIVE, uid_str)
                             pipe.zadd(KEY_ACTIVE_EXPIRY, {uid_str: now_ts + active_ttl})
+                            pipe.set(f"{KEY_HEARTBEAT_PREFIX}{uid_str}", "active", ex=HEARTBEAT_TTL_SEC)
                         pipe.incrby(KEY_PASS_COUNT, len(admitted))
                         await pipe.execute()
-                        logger.debug("Admitted %d user(s) from waiting queue", len(admitted))
+                        logger.debug("Admitted %d user(s) from waiting queue to active", len(admitted))
 
         except asyncio.CancelledError:
             logger.info("Background worker cancelled")
@@ -284,8 +366,11 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# 정적 파일 서빙 등록
+app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
-# ========================== A. Public API ==================================
+
+# ========================== A. Public & Session API =========================
 
 
 @app.get("/queue/status")
@@ -299,8 +384,12 @@ async def queue_status(user_id: str = Query(..., min_length=1)):
             content={"detail": "Access denied: user is blacklisted"},
         )
 
+    # 대기열 등록 및 하트비트 Key 초기화
+    await r.set(f"{KEY_HEARTBEAT_PREFIX}{user_id}", "checking", ex=HEARTBEAT_TTL_SEC)
+
     if await r.sismember(KEY_ACTIVE, user_id):
         token = await _issue_jwt(user_id)
+        await r.set(f"{KEY_HEARTBEAT_PREFIX}{user_id}", "active", ex=HEARTBEAT_TTL_SEC)
         return {"status": "ALLOWED", "token": token}
 
     bypass_threshold = await _cfg_int("bypass_threshold")
@@ -309,13 +398,7 @@ async def queue_status(user_id: str = Query(..., min_length=1)):
 
     if active_count < bypass_threshold and waiting_count == 0:
         active_ttl = await _cfg_int("active_ttl_sec")
-        now = time.time()
-        pipe = r.pipeline()
-        pipe.sadd(KEY_ACTIVE, user_id)
-        pipe.zadd(KEY_ACTIVE_EXPIRY, {user_id: now + active_ttl})
-        pipe.incr(KEY_PASS_COUNT)
-        await pipe.execute()
-        token = await _issue_jwt(user_id)
+        token = await _shift_to_active(user_id, active_ttl)
         return {"status": "ALLOWED", "token": token}
 
     rank = await r.zrank(KEY_WAITING, user_id)
@@ -336,6 +419,77 @@ async def queue_status(user_id: str = Query(..., min_length=1)):
     }
 
 
+# =================== Heartbeat & Session Cleanup APIs =====================
+
+
+@app.post("/api/heartbeat")
+@app.post("/queue/heartbeat")
+async def receive_heartbeat(body: HeartbeatRequest):
+    """
+    [요구사항 2] 클라이언트(JS)에서 10초 주기로 보낸 하트비트 수신 API.
+    - Redis Heartbeat Key 만료 시간(TTL)을 다시 30초로 갱신(EXPIRE)합니다.
+    - MPA 페이지 이동 시 하트비트 공백(수백 ms~1초)은 30초의 TTL 여유값으로 흡수됩니다.
+    """
+    r = redis_client
+    user_id = body.user_id
+    heartbeat_key = f"{KEY_HEARTBEAT_PREFIX}{user_id}"
+
+    is_active = await r.sismember(KEY_ACTIVE, user_id)
+    rank = await r.zrank(KEY_WAITING, user_id)
+
+    if not is_active and rank is None:
+        user_status = "unknown"
+    else:
+        user_status = "active" if is_active else "waiting"
+        # Redis Heartbeat Key TTL을 30초로 재갱신
+        await r.set(heartbeat_key, user_status, ex=HEARTBEAT_TTL_SEC)
+
+        # 액티브 상태인 경우 만료 시점 연장
+        if is_active:
+            active_ttl = await _cfg_int("active_ttl_sec")
+            await r.zadd(KEY_ACTIVE_EXPIRY, {user_id: time.time() + active_ttl})
+
+    return {
+        "status": "ok",
+        "user_id": user_id,
+        "user_status": user_status,
+        "ttl": HEARTBEAT_TTL_SEC,
+    }
+
+
+@app.post("/api/waiting/leave")
+@app.post("/api/logout")
+async def explicit_leave_or_logout(request: Request):
+    """
+    [요구사항 3] 명시적 이탈/로그아웃 및 sendBeacon 탭 닫기 수신 API.
+    - 대기열 목록(waiting_queue), 액티브 목록(active_users), 만료 ZSET, Heartbeat Key를 즉시 삭제합니다.
+
+    sendBeacon은 Content-Type을 항상 보장하지 않으므로(Blob 전송 시 브라우저별 차이),
+    Pydantic 모델 바인딩 대신 raw body를 직접 파싱하여 안정적으로 user_id를 추출합니다.
+    """
+    user_id = None
+    try:
+        raw_bytes = await request.body()
+        if raw_bytes:
+            raw_str = raw_bytes.decode("utf-8").strip()
+            try:
+                parsed = json.loads(raw_str)
+                if isinstance(parsed, dict):
+                    user_id = parsed.get("user_id")
+            except (json.JSONDecodeError, ValueError):
+                # JSON이 아닌 plain text로 user_id가 넘어온 경우
+                if raw_str:
+                    user_id = raw_str
+    except Exception as e:
+        logger.warning("Error parsing leave/logout request body: %s", e)
+
+    if not user_id:
+        return JSONResponse(status_code=400, content={"detail": "user_id is required"})
+
+    await _cleanup_user_session(user_id)
+    return {"status": "ok", "message": "User session and queue data explicitly cleaned up", "user_id": user_id}
+
+
 # =================== B. Client Queue WebSocket ==============================
 
 
@@ -353,12 +507,18 @@ async def ws_queue_status(websocket: WebSocket, user_id: str = Query(..., min_le
             await websocket.close(code=1008)
             return
 
+        # 하트비트 Key 등록 및 30초 TTL 부여
+        await r.set(f"{KEY_HEARTBEAT_PREFIX}{user_id}", "waiting", ex=HEARTBEAT_TTL_SEC)
+
         if not await r.sismember(KEY_ACTIVE, user_id):
             rank = await r.zrank(KEY_WAITING, user_id)
             if rank is None:
                 await r.zadd(KEY_WAITING, {user_id: time.time()})
 
         while True:
+            # 하트비트 키 TTL 유지 (EXPIRE 대신 SET EX로 만료된 키도 안전하게 재생성)
+            await r.set(f"{KEY_HEARTBEAT_PREFIX}{user_id}", "waiting", ex=HEARTBEAT_TTL_SEC)
+
             if await r.sismember(KEY_ACTIVE, user_id):
                 token = await _issue_jwt(user_id)
                 await websocket.send_json({"status": "ALLOWED", "token": token})
@@ -371,16 +531,8 @@ async def ws_queue_status(websocket: WebSocket, user_id: str = Query(..., min_le
 
             if active_count < bypass_threshold and waiting_count <= 1:
                 active_ttl = await _cfg_int("active_ttl_sec")
-                now = time.time()
-                pipe = r.pipeline()
-                # ZSET 명령어인 zrem을 확실하게 적용하여 파이프라인 오류 방지
-                pipe.zrem(KEY_WAITING, user_id)
-                pipe.sadd(KEY_ACTIVE, user_id)
-                pipe.zadd(KEY_ACTIVE_EXPIRY, {user_id: now + active_ttl})
-                pipe.incr(KEY_PASS_COUNT)
-                await pipe.execute()
-
-                token = await _issue_jwt(user_id)
+                # [요구사항 1] 대기열 -> 액티브 즉시 이관 (Shift)
+                token = await _shift_to_active(user_id, active_ttl)
                 await websocket.send_json({"status": "ALLOWED", "token": token})
                 await websocket.close()
                 break
@@ -432,11 +584,7 @@ async def receive_downstream_metrics(body: DownstreamMetrics):
 @app.post("/queue/expire-token")
 async def expire_token(body: ExpireTokenRequest):
     """Explicitly release an active user's slot."""
-    r = redis_client
-    pipe = r.pipeline()
-    pipe.srem(KEY_ACTIVE, body.user_id)
-    pipe.zrem(KEY_ACTIVE_EXPIRY, body.user_id)
-    await pipe.execute()
+    await _cleanup_user_session(body.user_id)
     logger.info("Explicitly expired token for user %s", body.user_id)
     return {"status": "ok", "user_id": body.user_id}
 
