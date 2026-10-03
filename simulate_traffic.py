@@ -4,7 +4,7 @@ import json
 import websockets
 
 SERVER_URL = "ws://localhost:8000/ws/queue/status?user_id="
-TOTAL_USERS = 500  # 동시 진입 가상 유저 수
+TOTAL_USERS = 500
 
 
 async def simulate_user(user_index: int):
@@ -26,7 +26,14 @@ async def simulate_user(user_index: int):
                 elif status == "ALLOWED":
                     token = data.get("token")
                     print(f"✅ [{user_id}] 입장 성공! (발급 Token: {token[:15]}...)")
+
+                    # [핵심 수정] 입장 성공 후 바로 종료하지 않고,
+                    # 일정 시간(예: 60초)동안 머물며 세션을 유지합니다.
+                    print(f"[{user_id}] 서비스 이용 중 (60초간 세션 유지)...")
+                    await asyncio.sleep(60)
                     break
+    except websockets.exceptions.ConnectionClosed:
+        pass
     except Exception as e:
         print(f"[{user_id}] 에러 발생: {e}")
 
@@ -39,5 +46,4 @@ async def main():
 
 
 if __name__ == "__main__":
-    # websockets 라이브러리 필요: pip install websockets
     asyncio.run(main())
